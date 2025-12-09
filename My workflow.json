@@ -1,0 +1,225 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "filters": {}
+      },
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        -240,
+        -256
+      ],
+      "id": "2d974b29-4017-4c71-9a81-f955fbbd6288",
+      "name": "Gmail Trigger",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "1Rz4iBTPcO4yGO09",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOllama",
+      "typeVersion": 1,
+      "position": [
+        240,
+        -272
+      ],
+      "id": "0d1d2a27-8205-4e53-ad31-a03f4bd7d422",
+      "name": "Ollama Chat Model",
+      "credentials": {
+        "ollamaApi": {
+          "id": "E9AGpIh9qL9MfN4h",
+          "name": "Ollama account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "reply",
+        "messageId": "={{$node[\"Prompt\"].json[\"messageId\"]}}",
+        "message": "={{$node[\"Prompt\"].json[\"threadId\"]}}\n\n{{$node[\"Prompt\"].json[\"threadId\"]}}\n\n{{$node[\"Prompt\"].json[\"from\"]}}\n\n{{$node[\"Response\"].json[\"replyText\"]}}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        720,
+        -128
+      ],
+      "id": "5706cf2c-57c6-49fa-ab80-1179c96b1d0b",
+      "name": "Reply to a message",
+      "webhookId": "f5264a71-122d-4f6e-bc98-eb5c62aa734e",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "1Rz4iBTPcO4yGO09",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code for \"Code in JavaScript\" (first code node after Gmail Trigger)\n// Purpose: normalize incoming email, optionally load JSONL examples (from Read Binary File nodes), and build prompt for Ollama.\n// Paste this into the FIRST code node (the one right after the Gmail Trigger).\n\n// === CONFIG ===\nconst EXAMPLE_NODE_NAMES = [\"Read Binary File\", \"Read Binary File1\"]; // try these node names for .jsonl examples\nconst MAX_EXAMPLES = 5;      // max few-shot examples to include\nconst MAX_EMAIL_LEN = 2000;  // truncate extremely long emails for prompt safety\n\n// === Helpers ===\nfunction safeGet(json, ...keys) {\n  for (const k of keys) {\n    if (json && json[k] !== undefined && json[k] !== null) return json[k];\n  }\n  return \"\";\n}\nfunction escapeForPrompt(s) {\n  if (s === undefined || s === null) return \"\";\n  return String(s).replace(/\\\\/g, \"\\\\\\\\\").replace(/\"/g, '\\\\\"').replace(/\\n/g, \"\\\\n\");\n}\nfunction tryParseJsonLine(line) {\n  try {\n    const p = JSON.parse(line);\n    if (p && typeof p === \"object\") return p;\n  } catch (e) {}\n  return null;\n}\n\n// === 1) Get the email from the Gmail trigger (first incoming item) ===\nconst input = items[0] && items[0].json ? items[0].json : {};\nconst emailBodyRaw = safeGet(input, \"bodyPlain\", \"body\", \"snippet\", \"bodyHtml\");\nlet emailBody = typeof emailBodyRaw === \"string\" ? emailBodyRaw.trim() : \"\";\n\n// crude strip tags if only HTML present\nif (!emailBody && input.bodyHtml && typeof input.bodyHtml === \"string\") {\n  emailBody = input.bodyHtml.replace(/<\\/?[^>]+(>|$)/g, \"\").trim();\n}\nif (emailBody.length > MAX_EMAIL_LEN) {\n  emailBody = emailBody.slice(0, MAX_EMAIL_LEN) + \"\\n\\n[TRUNCATED]\";\n}\n\nconst from = safeGet(input, \"from\", \"fromValue\", \"sender\", \"replyTo\") || \"\";\nconst subject = safeGet(input, \"subject\", \"Subject\") || \"\";\nconst threadId = safeGet(input, \"threadId\", \"id\", \"messageId\") || \"\";\nconst messageId = safeGet(input, \"id\", \"messageId\") || \"\";\n\n// === 2) Try to load .jsonl examples from a Read Binary File node if it exists ===\nlet examples = []; // will contain objects { email: \"...\", reply: \"...\" }\n\nfor (const nodeName of EXAMPLE_NODE_NAMES) {\n  try {\n    if ($node && $node[nodeName] && $node[nodeName].binary && $node[nodeName].binary.data && $node[nodeName].binary.data.data) {\n      const rawBase64 = $node[nodeName].binary.data.data;\n      const buff = Buffer.from(rawBase64, \"base64\");\n      const fileText = buff.toString(\"utf8\");\n      const lines = fileText.split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);\n      for (const line of lines) {\n        if (examples.length >= MAX_EXAMPLES) break;\n        const parsed = tryParseJsonLine(line);\n        if (parsed && (parsed.email || parsed.message || parsed.body) && parsed.reply) {\n          examples.push({\n            email: parsed.email || parsed.message || parsed.body,\n            reply: parsed.reply\n          });\n        } else if (parsed && parsed.input && parsed.output) {\n          examples.push({ email: parsed.input, reply: parsed.output });\n        } else if (parsed && parsed.prompt && parsed.response) {\n          examples.push({ email: parsed.prompt, reply: parsed.response });\n        }\n      }\n      if (examples.length) break;\n    }\n  } catch (e) {\n    // ignore and try next node name\n  }\n}\n\n// === 3) If no examples found, use safe built-in examples ===\nif (!examples.length) {\n  examples = [\n    { email: \"Hi — can you share the invoice for March? Thanks.\", reply: \"Sure — I will attach the March invoice and send it by EOD.\" },\n    { email: \"Can we postpone the meeting to Friday?\", reply: \"Friday works — I’ll update the invite to Friday at 3 PM.\" }\n  ];\n}\nif (examples.length > MAX_EXAMPLES) examples = examples.slice(0, MAX_EXAMPLES);\n\n// === 4) Build few-shot text ===\nconst fewShotText = examples.map((ex, i) => {\n  const e = escapeForPrompt(ex.email);\n  const r = escapeForPrompt(ex.reply);\n  return `Example ${i+1}:\\nEmail: \"${e}\"\\nReply: \"${r}\"`;\n}).join(\"\\n\\n\");\n\n// === 5) Construct the final prompt ===\nconst escapedEmail = escapeForPrompt(emailBody || \"(no body)\");\nconst escapedSubject = escapeForPrompt(subject || \"\");\nconst contextHeader = `You are an assistant that writes short, professional email replies. Match the tone and brevity of the examples. Always respond with a JSON object containing a single field \"reply\". Do NOT include any extra commentary.`;\n\nconst prompt = `${contextHeader}\n\nSubject: \"${escapedSubject}\"\n\n${fewShotText}\n\nNow produce a reply for the email below. Respond ONLY with a single-line JSON object like {\"reply\":\"...\"}.\n\nEmail: \"${escapedEmail}\"`;\n\n// === 6) Return item with metadata + prompt for Ollama ===\nreturn [{\n  json: {\n    from,\n    subject,\n    threadId,\n    messageId,\n    emailBody,\n    prompt,\n    _examples_used: examples.length\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -32,
+        -240
+      ],
+      "id": "9cb8e1d6-324e-42bf-a2bb-e6ff45626a77",
+      "name": "Prompt"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Code for \"Prompt1\" (parser - place this node immediately AFTER the Ollama node)\n// Purpose: locate and parse Ollama output robustly, produce replyText and metadata for Gmail Reply node.\n// Paste this into the SECOND code node (after Ollama).\n\n// === CONFIG: set this to your Ollama node exact label ===\nconst OLLAMA_NODE_NAME = \"Ollama Chat Model\"; // change if your node label differs\n\n// Helper: safely access node JSON\nfunction safeNodeJson(name) {\n  try {\n    if ($node && $node[name] && $node[name].json) return $node[name].json;\n  } catch (e) {}\n  return null;\n}\n\n// Try common node names / fallbacks to locate model output\nlet nodeData = safeNodeJson(OLLAMA_NODE_NAME)\n  || safeNodeJson(\"Ollama\")\n  || safeNodeJson(\"HTTP Request\")\n  || safeNodeJson(\"HTTP Request1\")\n  || (items && items[0] && items[0].json) // fallback to incoming item\n  || null;\n\n// Pull original metadata produced by your earlier \"Prompt\" (build prompt) node\nconst PROMPT_NODE_NAME = \"Prompt\"; // change if different\nlet meta = safeNodeJson(PROMPT_NODE_NAME) || (items && items[0] && items[0].json) || {};\n\n// helper to try parse JSON strings\nconst tryParse = (s) => {\n  if (typeof s !== 'string') return null;\n  try { return JSON.parse(s); } catch (e) { return null; }\n};\n\n// Defensive extraction of reply text\nlet replyText = \"\";\n\n// 1) direct reply field\nif (nodeData && typeof nodeData === 'object' && nodeData.reply) {\n  replyText = nodeData.reply;\n}\n\n// 2) nodeData is a JSON string that contains {\"reply\":...}\nif (!replyText && typeof nodeData === 'string') {\n  const p = tryParse(nodeData);\n  if (p && p.reply) replyText = p.reply;\n  else if (p && typeof p === 'string') replyText = p; // fallback to string content\n}\n\n// 3) OpenAI-like pattern: choices[0].text or choices[0].message.content\nif (!replyText && nodeData && nodeData.choices && nodeData.choices[0]) {\n  replyText = nodeData.choices[0].text || (nodeData.choices[0].message && nodeData.choices[0].message.content) || \"\";\n}\n\n// 4) Ollama pattern: output array with content/text\nif (!replyText && nodeData && Array.isArray(nodeData.output) && nodeData.output.length) {\n  for (const o of nodeData.output) {\n    if (!o) continue;\n    if (typeof o === 'string' && o.trim()) { replyText = o; break; }\n    if (o.content && typeof o.content === 'string' && o.content.trim()) { replyText = o.content; break; }\n    // nested content arrays\n    if (Array.isArray(o.content)) {\n      for (const c of o.content) {\n        if (typeof c === 'string' && c.trim()) { replyText = c; break; }\n        if (c && c.parts && Array.isArray(c.parts)) {\n          const joined = c.parts.join(' ').trim();\n          if (joined) { replyText = joined; break; }\n        }\n      }\n      if (replyText) break;\n    }\n    // some Ollama outputs: o.text\n    if (o.text && typeof o.text === 'string' && o.text.trim()) { replyText = o.text; break; }\n  }\n}\n\n// 5) other common fields\nif (!replyText && nodeData && nodeData.text) replyText = nodeData.text;\nif (!replyText && nodeData && nodeData.output_text) replyText = nodeData.output_text;\nif (!replyText && nodeData && nodeData.generated_text) replyText = nodeData.generated_text;\n\n// 6) If still empty, try to extract longest string property from nodeData as fallback\nif (!replyText && nodeData && typeof nodeData === 'object') {\n  const stringProps = Object.keys(nodeData).filter(k => typeof nodeData[k] === 'string' && nodeData[k].length > 0);\n  if (stringProps.length) {\n    stringProps.sort((a,b) => nodeData[b].length - nodeData[a].length);\n    replyText = nodeData[stringProps[0]];\n  }\n}\n\n// 7) Final cleanup: if replyText itself is a JSON string like \"{\\\"reply\\\":\\\"...\\\"}\", parse it\nif (typeof replyText === 'string') {\n  replyText = replyText.trim();\n  const maybeJson = tryParse(replyText);\n  if (maybeJson && maybeJson.reply && typeof maybeJson.reply === 'string') {\n    replyText = maybeJson.reply.trim();\n  }\n}\n\n// Ensure we return strings (avoid undefined)\nif (!replyText) replyText = \"\";\n\n// Build returned item: include metadata so Gmail Reply node can use it\nconst out = {\n  replyText,\n  from: meta.from || meta.fromEmail || meta.sender || (meta.emailBody && meta.emailBody.from) || \"\",\n  subject: meta.subject || \"\",\n  threadId: meta.threadId || meta.thread_id || meta.id || meta.messageId || \"\",\n  messageId: meta.messageId || meta.id || \"\"\n};\n\n// include raw debug copy for troubleshooting\nout._debug_raw = nodeData || null;\n\n// Return as single item\nreturn [{ json: out }];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        496,
+        -192
+      ],
+      "id": "cbf23794-f9b5-44d4-8ffe-8f9e368065b9",
+      "name": "Response"
+    },
+    {
+      "parameters": {
+        "modelId": {
+          "__rl": true,
+          "value": "gemma2:2b",
+          "mode": "list",
+          "cachedResultName": "gemma2:2b"
+        },
+        "messages": {
+          "values": [
+            {}
+          ]
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.ollama",
+      "typeVersion": 1,
+      "position": [
+        176,
+        -160
+      ],
+      "id": "c97bfba8-c34c-409d-8e0a-ad4f9745f62d",
+      "name": "Response Generator",
+      "credentials": {
+        "ollamaApi": {
+          "id": "zhhmPml3SEpmtvbH",
+          "name": "Ollama account 2"
+        }
+      }
+    }
+  ],
+  "pinData": {
+    "Gmail Trigger": [
+      {
+        "json": {
+          "id": "19afce37e8e2039e",
+          "threadId": "19afce37e8e2039e",
+          "snippet": "hiii",
+          "payload": {
+            "mimeType": "multipart/alternative"
+          },
+          "sizeEstimate": 5676,
+          "historyId": "146348",
+          "internalDate": "1765179349000",
+          "labels": [
+            {
+              "id": "INBOX",
+              "name": "INBOX"
+            },
+            {
+              "id": "IMPORTANT",
+              "name": "IMPORTANT"
+            },
+            {
+              "id": "CATEGORY_PERSONAL",
+              "name": "CATEGORY_PERSONAL"
+            }
+          ],
+          "From": "Akky Patel <akky05727@gmail.com>",
+          "Subject": "",
+          "To": "\"akkypatel705@gmail.com\" <akkypatel705@gmail.com>"
+        }
+      }
+    ]
+  },
+  "connections": {
+    "Gmail Trigger": {
+      "main": [
+        [
+          {
+            "node": "Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ollama Chat Model": {
+      "ai_languageModel": [
+        []
+      ]
+    },
+    "Prompt": {
+      "main": [
+        [
+          {
+            "node": "Response Generator",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Response": {
+      "main": [
+        [
+          {
+            "node": "Reply to a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Response Generator": {
+      "main": [
+        [
+          {
+            "node": "Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "b582ae54-1633-407f-987c-06128239bfba",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "78e63da62dc2c179f68c9f6693c681971ceb742a121fcc264d591138a8f86c64"
+  },
+  "id": "EXXhJ91xJBWFxmFw",
+  "tags": []
+}
